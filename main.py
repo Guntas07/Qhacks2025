@@ -1,8 +1,11 @@
 from urllib.parse import urlparse
 import boto3
 import psycopg2
+import os
 import re
 from nltk.stem import PorterStemmer
+from datetime import datetime
+from similarity import rank_by_tfidf_cosine, sklearn_available
 
 # Initialize stemmer
 stemmer = PorterStemmer()
@@ -35,22 +38,28 @@ def preprocess_text(text):
     stemmed_words = [stemmer.stem(word) for word in words]  # Apply stemming using nltk library
     return ' '.join(stemmed_words)
 
+# DB connection helper
+def get_db_conn():
+    return psycopg2.connect(
+        dbname=os.getenv("DB_NAME", "Company Database"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", "QHacks"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+    )
+
+
 # Get product names, descriptions, prices, and seller names from the database
 def fetch_product_data():
     try:
-        # Connect to the PostgreSQL database on my local device
-        connection = psycopg2.connect(
-            dbname="Company Database",
-            user="postgres",
-            password="QHacks",
-            host="localhost",
-            port="5432"
-        )
+        # Connect to the PostgreSQL database
+        connection = get_db_conn()
         cursor = connection.cursor()
 
         # Fetch product details including seller
         cursor.execute("""
             SELECT 
+                p.product_id,
                 p.product_name, 
                 p.description, 
                 p.price, 
@@ -59,7 +68,17 @@ def fetch_product_data():
             JOIN business b ON p.business_id = b.business_id;
         """)
 
-        product_data = cursor.fetchall()  # Returns a list of tuples
+        rows = cursor.fetchall()
+        product_data = [
+            {
+                "product_id": r[0],
+                "product_name": r[1],
+                "description": r[2],
+                "price": r[3],
+                "seller": r[4],
+            }
+            for r in rows
+        ]
 
         cursor.close()
         connection.close()
@@ -85,25 +104,70 @@ def calculate_similarity_score(words, name_words, desc_words):
     return len(matched_words)
 
 # Find matching products based on similarity score
-def find_matching_products(words, product_data):
+def _find_matching_products_keyword(words, product_data):
     matching_products = []
-
-    for name, desc, price, seller in product_data:
-        # Preprocess product name and description
-        name_words = preprocess_text(name).split()
-        desc_words = preprocess_text(desc).split()
-
-        # Calculate similarity score
+    for p in product_data:
+        name_words = preprocess_text(p["product_name"]).split()
+        desc_words = preprocess_text(p["description"]).split()
         score = calculate_similarity_score(words, name_words, desc_words)
-
-        # Check if any word from key phrases is in the product name or description
         if score > 0:
-            matching_products.append((name, desc, price, seller, score))
-
-    # Sort matching products by similarity score in descending order (for every x, look at x[-1] which is the score)
-    matching_products.sort(key=lambda x: x[-1], reverse=True)
-
+            matching_products.append(
+                (p["product_name"], p["description"], p["price"], p["seller"], float(score), p["product_id"])  # include id
+            )
+    matching_products.sort(key=lambda x: x[-2], reverse=True)
     return matching_products
+
+
+def find_matching_products(words, product_data):
+    if sklearn_available():
+        query_text = " ".join(words)
+        product_texts = [
+            preprocess_text(f"{p['product_name']} {p['description']}") for p in product_data
+        ]
+        try:
+            sims = rank_by_tfidf_cosine(query_text, product_texts)
+            results = []
+            for p, score in zip(product_data, sims):
+                if score > 0:
+                    results.append(
+                        (p["product_name"], p["description"], p["price"], p["seller"], float(score), p["product_id"])  # include id
+                    )
+            results.sort(key=lambda x: x[-2], reverse=True)
+            return results
+        except Exception:
+            pass
+    return _find_matching_products_keyword(words, product_data)
+
+
+def persist_matches(amazon_url: str, matches: list[tuple], limit: int = 150) -> int:
+    if not matches:
+        return 0
+    to_insert = matches[:limit]
+    try:
+        conn = get_db_conn()
+        cur = conn.cursor()
+        cur.executemany(
+            (
+                "INSERT INTO comparable_items (amazon_url, product_id, similarity_score, created_at) "
+                "VALUES (%s, %s, %s, %s)"
+            ),
+            [
+                (
+                    amazon_url,
+                    m[-1],  # product_id
+                    m[-2],  # similarity_score
+                    datetime.utcnow(),
+                )
+                for m in to_insert
+            ],
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return len(to_insert)
+    except Exception as e:
+        print(f"Error persisting matches: {e}")
+        return 0
 
 # Main function
 def main(amazon_url):
@@ -134,12 +198,16 @@ def main(amazon_url):
         print("\nNo matching products found.")
     else:
         print("\nMatching Products:")
-        for name, desc, price, seller, score in matching_products:
+        for name, desc, price, seller, score, _pid in matching_products:
             print(f"Product: {name}")
             print(f"Price: ${price:.2f}")
             print(f"Sold by: {seller}")
             print(f"Description: {desc}")
             print(f"Similarity Score: {score}\n")
+
+        # Persist top 150 matches
+        inserted = persist_matches(amazon_url, matching_products, limit=150)
+        print(f"Persisted {inserted} comparable items to Postgres.")
 
 
 if __name__ == "__main__":
